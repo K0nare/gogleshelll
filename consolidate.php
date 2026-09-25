@@ -102,6 +102,7 @@ function mbLevenshtein(string $a, string $b): int {
     return $prev[$lb];
 }
 
+
 function rowTokens(array $row): array {
     $longest = '';
     foreach ($row as $v) {
@@ -121,10 +122,13 @@ function rowTokens(array $row): array {
     }
     return array_keys($out);
 }
-function jaccard(array $a, array $b): float {
-    if (count($a) < 2 || count($b) < 2) return 0.0;
-    $inter = count(array_intersect($a, $b));
-    $union = count(array_unique(array_merge($a, $b)));
+
+function jaccardSets(array $setA, int $sizeA, array $setB, int $sizeB): float {
+    // $setA/$setB — flip-карты токенов (token => true)
+    if ($sizeA < 2 || $sizeB < 2) return 0.0;
+    $inter = 0;
+    foreach ($setA as $t => $_) if (isset($setB[$t])) $inter++;
+    $union = $sizeA + $sizeB - $inter;
     return $union > 0 ? $inter / $union : 0.0;
 }
 
@@ -154,6 +158,20 @@ function detectSite(string $text): string {
 
 // ====================== КЛАССИФИКАЦИЯ ======================
 function classify(array $row): array {
+    // Кэш классификации: одни и те же строки массово повторяются между
+    // файлами-копиями, а classifyRaw — это десятки regex на каждую строку.
+    // Возвращается СВЕЖАЯ КОПИЯ результата (со своим массивом sources),
+    // поэтому мутации элементов в дедупликации не влияют на кэш и на другие
+    // экземпляры той же строки — поведение идентично отсутствию кэша.
+    static $cache = [];
+    $ck = sha1(implode("\x1f", $row));
+    if (!isset($cache[$ck])) $cache[$ck] = classifyRaw($row);
+    $res = $cache[$ck];
+    if (($res['section'] ?? '') !== 'skip') $res['sources'] = [];
+    return $res;
+}
+
+function classifyRaw(array $row): array {
     $ne = [];
     foreach ($row as $v) { $v = trim((string)$v); if ($v !== '') $ne[] = $v; }
     if (empty($ne)) return ['section' => 'skip'];
@@ -242,6 +260,20 @@ function hardKey(array $item): string {
     return $sec . '||' . $name;
 }
 
+// Слияние дубликата в существующий элемент (источники/описания/значения)
+function mergeInto(array &$dst, array $srcItem): void {
+    foreach (($srcItem['sources'] ?? []) as $src) {
+        if (!isset($dst['srcSet'][$src])) {
+            $dst['srcSet'][$src] = true;
+            $dst['sources'][] = $src;
+        }
+    }
+    if (mb_strlen((string)($srcItem['desc'] ?? '')) > mb_strlen((string)($dst['desc'] ?? '')))
+        $dst['desc'] = $srcItem['desc'];
+    if (mb_strlen((string)($srcItem['value'] ?? '')) > mb_strlen((string)($dst['value'] ?? '')))
+        $dst['value'] = $srcItem['value'];
+}
+
 function hardDedupe(array &$store): array {
     global $LEV_MAX_DIST, $JACCARD_HARD;
 
@@ -262,17 +294,10 @@ function hardDedupe(array &$store): array {
         foreach ($items as $it) {
             $k = hardKey($it);
             if (isset($seenExact[$k])) {
-                $idx = $seenExact[$k];
-                foreach (($it['sources'] ?? []) as $src) {
-                    if (!in_array($src, $step1[$idx]['sources'], true)) {
-                        $step1[$idx]['sources'][] = $src;
-                    }
-                }
-                if (mb_strlen($it['desc'] ?? '') > mb_strlen($step1[$idx]['desc'] ?? ''))
-                    $step1[$idx]['desc'] = $it['desc'];
-                if (mb_strlen($it['value'] ?? '') > mb_strlen($step1[$idx]['value'] ?? ''))
-                    $step1[$idx]['value'] = $it['value'];
+                mergeInto($step1[$seenExact[$k]], $it);
             } else {
+                $it['srcSet'] = [];
+                foreach (($it['sources'] ?? []) as $src) $it['srcSet'][$src] = true;
                 $seenExact[$k] = count($step1);
                 $step1[] = $it;
             }
@@ -319,7 +344,8 @@ function hardDedupe(array &$store): array {
             }
         }
 
-        // ШАГ 3: Jaccard
+        // ШАГ 3: Jaccard (множества-карты вместо list+array_intersect/merge —
+        // результат идентичен, но без квадратичных аллокаций на сравнение)
         $step3 = [];
         $jaccTokens = [];
         $jaccIndex = [];
@@ -330,16 +356,17 @@ function hardDedupe(array &$store): array {
 
             if ($sec !== 'strategy' || count($tokens) < 2) {
                 $step3[] = $it;
-                $jaccTokens[] = $tokens;
+                $jaccTokens[] = array_fill_keys($tokens, true);
                 continue;
             }
 
             $groupKey = ($it['type'] ?? 'ПРОЧЕЕ') . '|' . ($it['side'] ?? 'ANY') . '|' . ($it['site'] ?? 'ALL');
             $foundIdx = null;
+            $tokenMap = array_fill_keys($tokens, true);
 
             if (isset($jaccIndex[$groupKey])) {
                 foreach ($jaccIndex[$groupKey] as $idx) {
-                    $sim = jaccard($tokens, $jaccTokens[$idx]);
+                    $sim = jaccardSets($tokenMap, count($tokenMap), $jaccTokens[$idx], count($jaccTokens[$idx]));
                     if ($sim >= $JACCARD_HARD) {
                         $foundIdx = $idx;
                         break;
@@ -355,14 +382,18 @@ function hardDedupe(array &$store): array {
                 }
                 if (mb_strlen($it['desc'] ?? '') > mb_strlen($step3[$foundIdx]['desc'] ?? ''))
                     $step3[$foundIdx]['desc'] = $it['desc'];
-                $jaccTokens[$foundIdx] = array_values(array_unique(array_merge($jaccTokens[$foundIdx], $tokens)));
+                $jaccTokens[$foundIdx] += $tokenMap; // union
             } else {
                 $newIdx = count($step3);
                 $step3[] = $it;
-                $jaccTokens[] = $tokens;
+                $jaccTokens[] = $tokenMap;
                 $jaccIndex[$groupKey][] = $newIdx;
             }
         }
+
+        // снимаем служебное поле srcSet
+        foreach ($step3 as &$it3) unset($it3['srcSet']);
+        unset($it3);
 
         $removed = count($items) - count($step3);
         $data['items'] = $step3;
